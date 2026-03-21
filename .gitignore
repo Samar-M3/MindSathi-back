@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# Logs
+*.log
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Type checker / lint caches
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+app/mindsathi-a97af-firebase-adminsdk-fbsvc-f2870a3d02.json
+*.firebase-adminsdk-*.json
+
+# OS files
+.DS_Store
+Thumbs.db
