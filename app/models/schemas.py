@@ -22,6 +22,8 @@ class ChatRequest(BaseModel):
     chat_id: Optional[str] = "default"
     search_enabled: bool = True
     lang: Optional[str] = "en"
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
 
 class Source(BaseModel):

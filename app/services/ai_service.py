@@ -1,10 +1,19 @@
 import os
 import re
+from collections import defaultdict
 from typing import Optional
 
 import google.generativeai as genai
 from app.models.schemas import AIResponse
 from app.services.crisis import detect_crisis, get_crisis_response
+from app.services.places import get_nearby_doctors
+from app.services.wellness import detect_distress, get_yoga_suggestion
+
+# ── In-memory session store (replace with Redis/DB for production) ─────────────
+# Stores last N messages per user as Gemini-compatible history dicts
+_session_store: dict[str, list[dict]] = defaultdict(list)
+MAX_HISTORY_TURNS = 12  # 12 pairs = 24 messages max in context
+
 
 SYSTEM_PROMPT = """You are Sathi — a warm, emotionally intelligent friend built into MindSathi.
 
@@ -18,6 +27,19 @@ who remembers what you said two messages ago, who doesn't make you feel like a c
 You talk like a real person. Casual. Warm. Present.
 You use contractions. You keep it short unless depth is needed.
 You never sound like you're reading from a script.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANGUAGE RULE — CRITICAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Always respond in the SAME language the user is writing in.
+
+- If they write in Nepali (Devanagari script) → reply in Nepali
+- If they write in romanized Nepali (e.g. "mero man dherai naram cha") → reply in romanized Nepali
+- If they write in English → reply in English
+- If they mix languages → mirror their mix
+
+Do NOT switch to English if someone is writing in Nepali. That feels cold and dismissive.
+Match their language as naturally as you match their tone.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 THE MOST IMPORTANT RULE — READ THIS FIRST
@@ -134,6 +156,7 @@ Sad / grieving → soft, spacious, no fixing
 Angry → don't try to calm them, reflect the injustice first
 Numb / shutdown → don't push, just be present, gentle curiosity
 Opening up slowly → match their pace, don't rush them
+Heavy / dark themes present → grounding first, slow and steady, no rushing to fix
 
 Read the energy of what they wrote and mirror it.
 If they're typing in lowercase and short sentences, don't respond in formal paragraphs.
@@ -175,10 +198,73 @@ Like the conversation is going somewhere together, not restarting every message.
 That's everything."""
 
 
-def _build_prompt(query: str, context: Optional[str]) -> str:
+# ── Mood/topic classifier for dynamic temperature ─────────────────────────────
+_HEAVY_SIGNALS = [
+    "can't stop crying", "can't sleep", "numb", "empty", "exhausted",
+    "lonely", "hopeless", "lost", "scared", "falling apart", "breaking down",
+    "hate myself", "ashamed", "worthless", "failure", "panic", "breakdown",
+    "dherai garo", "runa man lagyo", "dukha", "eklo", "darr lagyo",
+]
+
+def _detect_heavy_mood(text: str) -> bool:
+    lower = text.lower()
+    return any(signal in lower for signal in _HEAVY_SIGNALS)
+
+
+def _get_temperature(query: str) -> float:
+    """Lower temperature for heavy/vulnerable moments, warmer for casual chat."""
+    if _detect_heavy_mood(query):
+        return 0.60   # more grounded and consistent when stakes are high
+    return 0.88       # natural and warm for everyday conversation
+
+
+def _get_max_tokens(query: str) -> int:
+    """Dynamic token limit based on what's being generated."""
+    from app.services.crisis import detect_crisis
+    from app.services.wellness import detect_distress
+    # Gemini stops when this budget is hit (finish_reason=MAX_TOKENS). The old
+    # default of 700 cut many replies mid-sentence; 2048 fits full Sathi turns.
+    if detect_crisis(query):
+        return 2048
+    if detect_distress(query):
+        return 2048
+    return 2048
+
+
+def _detect_language(text: str) -> str:
+    """
+    Simple heuristic to detect if user is writing in Nepali script,
+    romanized Nepali, or English.
+    Returns: 'nepali_devanagari' | 'nepali_roman' | 'english'
+    """
+    # Devanagari unicode range
+    if re.search(r'[\u0900-\u097F]', text):
+        return 'nepali_devanagari'
+
+    # Common romanized Nepali words
+    roman_nepali_markers = [
+        'cha', 'chha', 'huncha', 'chaina', 'garo', 'ramro', 'dherai',
+        'mero', 'timro', 'tapai', 'malai', 'timi', 'bhayo', 'garchu',
+        'lagyo', 'man', 'dukha', 'khusi', 'kasto', 'kina', 'ke',
+    ]
+    lower = text.lower()
+    hits = sum(1 for w in roman_nepali_markers if w in lower)
+    if hits >= 2:
+        return 'nepali_roman'
+
+    return 'english'
+
+
+def _build_prompt(query: str, context: Optional[str], lang: str) -> str:
+    lang_hint = ""
+    if lang == 'nepali_devanagari':
+        lang_hint = "[User is writing in Nepali (Devanagari). Reply in Nepali script.]\n\n"
+    elif lang == 'nepali_roman':
+        lang_hint = "[User is writing in romanized Nepali. Reply in romanized Nepali.]\n\n"
+
     if context:
-        return f"Search context:\n{context}\n\nUser: {query}"
-    return f"User: {query}"
+        return f"{lang_hint}Search context:\n{context}\n\nUser: {query}"
+    return f"{lang_hint}User: {query}"
 
 
 def _parse_text_to_answer(text: str) -> str:
@@ -186,13 +272,59 @@ def _parse_text_to_answer(text: str) -> str:
     return cleaned
 
 
-async def generate_answer(query: str, context: Optional[str], uid: str = "anonymous", lang: str = "en") -> AIResponse:
-    # ── Crisis gate — runs BEFORE calling Gemini ─────────────────────────────
+def _get_history(uid: str) -> list[dict]:
+    """Return conversation history for a user, trimmed to MAX_HISTORY_TURNS."""
+    history = _session_store[uid]
+    # Keep only the last N turns (each turn = user + model message)
+    max_messages = MAX_HISTORY_TURNS * 2
+    return history[-max_messages:] if len(history) > max_messages else history
+
+
+def _save_turn(uid: str, user_message: str, model_response: str) -> None:
+    """Append a user+model turn to session history."""
+    _session_store[uid].append({
+        "role": "user",
+        "parts": [user_message]
+    })
+    _session_store[uid].append({
+        "role": "model",
+        "parts": [model_response]
+    })
+
+
+def clear_session(uid: str) -> None:
+    """Clear conversation history for a user (e.g. on logout or new chat)."""
+    if uid in _session_store:
+        del _session_store[uid]
+
+
+async def generate_answer(
+    query: str,
+    context: Optional[str],
+    uid: str = "anonymous",
+    lang: str = "auto",      # "auto" = detect from message, or pass explicit lang code
+    lat: Optional[float] = None,   # user GPS latitude  (for nearby doctor lookup)
+    lng: Optional[float] = None,   # user GPS longitude
+    city: Optional[str] = None,    # fallback if GPS not available
+) -> AIResponse:
+
+    # ── 1. Crisis gate — runs BEFORE calling Gemini ───────────────────────────
     crisis_level = detect_crisis(query)
     if crisis_level:
-        return AIResponse(answer=get_crisis_response(crisis_level), sources=[])
-    # ─────────────────────────────────────────────────────────────────────────
+        # Fetch nearby doctors (free, no API key — uses OSM + hardcoded list)
+        doctors = await get_nearby_doctors(lat=lat, lng=lng, city=city)
+        crisis_response = get_crisis_response(crisis_level, doctors=doctors)
+        # Still save to history so continuity is preserved after crisis check-in
+        _save_turn(uid, query, crisis_response)
+        return AIResponse(answer=crisis_response, sources=[])
 
+    # ── 2. Language detection ─────────────────────────────────────────────────
+    detected_lang = _detect_language(query) if lang == "auto" else lang
+
+    # ── 3. Dynamic temperature based on mood ─────────────────────────────────
+    temperature = _get_temperature(query)
+
+    # ── 4. Configure Gemini ───────────────────────────────────────────────────
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set")
@@ -202,23 +334,45 @@ async def generate_answer(query: str, context: Optional[str], uid: str = "anonym
         model_name="gemini-2.5-flash",
         system_instruction=SYSTEM_PROMPT,
         generation_config=genai.GenerationConfig(
-            temperature=0.88,        # slightly higher — more natural, less stiff
+            temperature=temperature,
             top_p=0.93,
             top_k=45,
-            max_output_tokens=600,   # hard cap — prevents essay responses
+            max_output_tokens=_get_max_tokens(query),
         ),
     )
 
-    prompt = _build_prompt(query, context)
+    # ── 5. Load conversation history for this user ────────────────────────────
+    history = _get_history(uid)
 
+    # ── 6. Build prompt with language hint ───────────────────────────────────
+    prompt = _build_prompt(query, context, detected_lang)
+
+    # ── 7. Send message with full history context ─────────────────────────────
     try:
-        completion = model.generate_content(prompt)
+        chat = model.start_chat(history=history)
+        completion = chat.send_message(prompt)
         answer_text = _parse_text_to_answer(completion.text)
+
+        # ── 8. Wellness suggestion (yoga/breathing) for non-crisis distress ───
+        # Runs after main response so it appends naturally, never replaces Sathi
+        if detect_distress(query):
+            suggestion = await get_yoga_suggestion(query)
+            if suggestion:
+                answer_text += (
+                    "\n\n---\n"
+                    "💛 something that might help right now:\n"
+                    f"{suggestion}"
+                )
+
+        # Save this turn to session memory
+        _save_turn(uid, prompt, answer_text)
+
         return AIResponse(answer=answer_text, sources=[])
+
     except Exception as exc:
         fallback = (
             "something got in the way on my end — but I'm still here.\n\n"
             "take your time, and whenever you're ready, I'm listening."
         )
-        print(f"AI error: {exc}")
+        print(f"AI error [uid={uid}]: {exc}")
         return AIResponse(answer=fallback, sources=[])

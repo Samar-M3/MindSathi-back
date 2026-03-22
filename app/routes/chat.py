@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import ChatRequest, ChatResponse, Source
-from app.services.ai.router import generate_ai_response
+from app.services.ai_service import generate_answer
 from app.services.search_service import web_search, build_context
 from app.utils.decision_engine import needs_web_search
 from app.services.firebase_service import save_message, get_history, get_messages
@@ -33,11 +33,16 @@ async def chat(request: ChatRequest):
 
     uid = request.uid or request.user_id or "anonymous"
 
-    full_prompt = query
-    if context:
-        full_prompt = f"{query}\n\nContext:\n{context}"
-
-    answer_text = await asyncio.to_thread(generate_ai_response, full_prompt)
+    lang = request.lang if request.lang is not None else "auto"
+    ai_result = await generate_answer(
+        query,
+        context,
+        uid=uid,
+        lang=lang,
+        lat=request.lat,
+        lng=request.lng,
+    )
+    answer_text = ai_result.answer
 
     sources = []
     if search_results:
